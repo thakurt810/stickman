@@ -29,11 +29,12 @@ W, H           = 720, 1280          # output resolution (portrait reel)
 LAUGH_SWAP_FPS = 5                  # times/sec left↔right swaps during laugh
 LAUGH_DURATION = 5.0                # seconds for laugh scene
 
-# Paths — adjust if running locally
-IMAGES_DIR  = os.environ.get("IMAGES_DIR",  "/mnt/user-data/uploads")
-OUTPUT_DIR  = os.environ.get("OUTPUT_DIR",  "output")
-AUDIO_DIR   = os.environ.get("AUDIO_DIR",   "audio")
-METADATA_DIR= os.environ.get("METADATA_DIR","metadata")
+# Paths — all relative to the script's own directory by default
+_SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
+IMAGES_DIR   = os.environ.get("IMAGES_DIR",   os.path.join(_SCRIPT_DIR, "images"))
+OUTPUT_DIR   = os.environ.get("OUTPUT_DIR",   os.path.join(_SCRIPT_DIR, "output"))
+AUDIO_DIR    = os.environ.get("AUDIO_DIR",    os.path.join(_SCRIPT_DIR, "audio"))
+METADATA_DIR = os.environ.get("METADATA_DIR", os.path.join(_SCRIPT_DIR, "metadata"))
 
 GEMINI_API_KEY        = os.environ.get("GEMINI_API_KEY", "")
 GOOGLE_DRIVE_FOLDER   = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
@@ -331,7 +332,7 @@ RULES:
 4. Line 3 (A): Punchline only. No explanation. Max 12 words. Funny due to wordplay.
 5. Line 4 (AB): Must be exactly — Ha ha ha ha ha ha ha ha!
 6. Do NOT add numbering, labels, asterisks, explanations, or commentary outside the 4 lines.
-7. Do NOT reuse: "no C in the dark", "outstanding in his field", "nacho cheese".
+7. Do NOT reuse: "no C in dark", "outstanding in his field", "nacho cheese".
 8. Output only the 4 lines. Nothing before. Nothing after."""
 
     for attempt in range(1, MAX_RETRIES + 1):
