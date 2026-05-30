@@ -1,0 +1,16 @@
+# Core video/image processing
+moviepy==1.0.3
+Pillow>=10.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Text-to-speech
+edge-tts>=6.1.9
+
+# Gemini AI (new SDK)
+google-genai>=0.7.0
+
+# Google Drive upload (optional — only needed if UPLOAD_TO_DRIVE = True)
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
