@@ -60,7 +60,7 @@ jobs:
           GDRIVE_TOKEN_BASE64:       ${{ secrets.GDRIVE_TOKEN_BASE64 }}
           GDRIVE_CREDENTIALS_JSON:   ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
           UPLOAD_TO_DRIVE:           "true"
-        run: python stickman_dadjoke_v2.py
+        run: python stickman.py
 
       # ── 6. Commit state.json back to repo ──────────────────────────────
       - name: Save joke state back to repo
