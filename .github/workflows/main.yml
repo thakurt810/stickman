@@ -1,4 +1,4 @@
-name: Vegetable Love Story Pipeline
+name: Stickman Dad Joke Pipeline
 
 on:
   schedule:
@@ -18,19 +18,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Needed so the GITHUB_TOKEN can push commits back to the repo
+    permissions:
+      contents: write
+
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # ── 1. Checkout (full history so we can push back) ──────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GIT_PAT }}   # PAT so the push is authenticated
+          fetch-depth: 0                  # full history avoids shallow-push errors
 
-      # ── 2. Python ──────────────────────────────────────────────────────────
+      # ── 2. Python ──────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── 3. System deps ─────────────────────────────────────────────────────
+      # ── 3. System deps ─────────────────────────────────────────────────
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
@@ -39,28 +46,39 @@ jobs:
             fonts-dejavu-core \
             fonts-liberation
 
-      # ── 4. Python packages ─────────────────────────────────────────────────
+      # ── 4. Python packages ─────────────────────────────────────────────
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 5. Run pipeline ────────────────────────────────────────────────────
+      # ── 5. Run pipeline ────────────────────────────────────────────────
       - name: Run pipeline
         env:
-          GEMINI_API_KEY:            ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_DRIVE_FOLDER_ID:    ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
           METADATA_DRIVE_FOLDER_ID:  ${{ secrets.METADATA_DRIVE_FOLDER_ID }}
           GDRIVE_TOKEN_BASE64:       ${{ secrets.GDRIVE_TOKEN_BASE64 }}
           GDRIVE_CREDENTIALS_JSON:   ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
           UPLOAD_TO_DRIVE:           "true"
-        run: python stickman.py
+        run: python stickman_dadjoke_v2.py
 
-      # ── 6. Upload artifacts to GitHub too (backup) ────────────────────────
+      # ── 6. Commit state.json back to repo ──────────────────────────────
+      - name: Save joke state back to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          # Only commit if state.json actually changed
+          git diff --cached --quiet || git commit -m "chore: advance joke pointer [skip ci]"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GIT_PAT }}
+
+      # ── 7. Upload artifacts to GitHub (backup) ─────────────────────────
       - name: Upload output files
         uses: actions/upload-artifact@v4
         with:
-          name: vegetable-story-${{ github.run_number }}
+          name: stickman-joke-${{ github.run_number }}
           path: |
             output/*.mp4
             metadata/*.json
