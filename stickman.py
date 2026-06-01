@@ -1,69 +1,57 @@
 """
-😂 Stickman Dad Joke Pipeline  — Full Scene Image Edition  v2
+😂 Stickman Dad Joke Pipeline  — Full Scene Image Edition  v3
 ==============================================================
-Portrait 720×1280  |  4 full-scene images  |  edge-tts audio  |  Gemini jokes
+Portrait 720×1280  |  4 full-scene images  |  edge-tts audio
+Jokes sourced from jokes.xlsx (columns: S.no, A, B, A again, Laugh)
+State tracked in state.json (committed back to repo after each run)
+
 Images used:
   black_talking.png  — black is speaking, orange listening
   orange_talking.png — orange is speaking, black listening
   left.png           — both laughing pose A
   right.png          — both laughing pose B  (alternated rapidly)
 
-Bubble placement:
-  black  talking → bubble top-left  area (over black character)
-  orange talking → bubble top-right area (over orange character)
-  laughing       → bubble centred, yellow tint + floating HA! text
-
 Run:
-  pip install pillow numpy imageio[ffmpeg] edge-tts google-genai
+  pip install pillow numpy imageio[ffmpeg] edge-tts openpyxl
   python3 stickman_dadjoke_v2.py
 """
 
-import os, json, asyncio, random, math, struct, wave, time, subprocess
+import os, json, asyncio, random, struct, wave, time, subprocess
 import numpy as np
 from datetime import datetime
 from PIL import Image, ImageDraw, ImageFont
 
 # ── CONFIGURATION ──────────────────────────────────────────────────────────
 FPS            = 24
-W, H           = 720, 1280          # output resolution (portrait reel)
-LAUGH_SWAP_FPS = 5                  # times/sec left↔right swaps during laugh
-LAUGH_DURATION = 5.0                # seconds for laugh scene
+W, H           = 720, 1280
+LAUGH_SWAP_FPS = 5
+LAUGH_DURATION = 5.0
 
-# Paths — all relative to the script's own directory by default
 _SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR   = os.environ.get("IMAGES_DIR",   os.path.join(_SCRIPT_DIR, "images"))
 OUTPUT_DIR   = os.environ.get("OUTPUT_DIR",   os.path.join(_SCRIPT_DIR, "output"))
 AUDIO_DIR    = os.environ.get("AUDIO_DIR",    os.path.join(_SCRIPT_DIR, "audio"))
 METADATA_DIR = os.environ.get("METADATA_DIR", os.path.join(_SCRIPT_DIR, "metadata"))
 
-GEMINI_API_KEY        = os.environ.get("GEMINI_API_KEY", "")
+# jokes.xlsx and state.json live in the repo root (same as script)
+JOKES_FILE   = os.environ.get("JOKES_FILE",  os.path.join(_SCRIPT_DIR, "jokes.xlsx"))
+STATE_FILE   = os.environ.get("STATE_FILE",  os.path.join(_SCRIPT_DIR, "state.json"))
+
 GOOGLE_DRIVE_FOLDER   = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 METADATA_DRIVE_FOLDER = os.environ.get("METADATA_DRIVE_FOLDER_ID", "")
 UPLOAD_TO_DRIVE       = os.environ.get("UPLOAD_TO_DRIVE", "false").lower() == "true"
-BG_MUSIC_PATH         = os.environ.get("BG_MUSIC_PATH", "")
 
-VOICE_A = "en-US-GuyNeural"      # Black  stickman
-VOICE_B = "en-US-AriaNeural"     # Orange stickman
+VOICE_A = "en-US-GuyNeural"
+VOICE_B = "en-US-AriaNeural"
 
 MAX_RETRIES = 3
 
-# Bubble anchor positions (cx, top_y) in the OUTPUT 720×1280 frame
-# Black  is on LEFT  → bubble upper-left
-# Orange is on RIGHT → bubble upper-right
-BUBBLE_BLACK_CX  = 210   # centre-x of black's bubble
-BUBBLE_ORANGE_CX = 510   # centre-x of orange's bubble
-BUBBLE_TOP_Y     = 60    # y where bubble starts from top
-BUBBLE_AB_CX     = 360   # centred for laugh bubble
+BUBBLE_BLACK_CX  = 210
+BUBBLE_ORANGE_CX = 510
+BUBBLE_TOP_Y     = 60
+BUBBLE_AB_CX     = 360
 
 # ── OPTIONAL IMPORTS ───────────────────────────────────────────────────────
-try:
-    from google import genai as google_genai
-    from google.genai import types as genai_types
-    HAS_GEMINI = True
-except ImportError:
-    HAS_GEMINI = False
-    print("⚠️  google-genai not installed — will use demo joke.")
-
 try:
     import edge_tts
     HAS_EDGE_TTS = True
@@ -78,12 +66,142 @@ except ImportError:
     HAS_IMAGEIO = False
     print("⚠️  imageio not installed — pip install imageio[ffmpeg]")
 
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+    print("⚠️  openpyxl not installed — pip install openpyxl")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1.  SCENE IMAGE LOADER
+# 1.  JOKE LOADER  (from jokes.xlsx)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_jokes() -> list:
+    """
+    Load all jokes from jokes.xlsx.
+    Expected columns: S.no | A | B | A again | Laugh
+    Returns list of dicts with keys: index, A, B, A_again, Laugh
+    """
+    if not HAS_OPENPYXL:
+        raise RuntimeError("openpyxl is required: pip install openpyxl")
+    if not os.path.exists(JOKES_FILE):
+        raise FileNotFoundError(f"jokes.xlsx not found at: {JOKES_FILE}")
+
+    wb     = openpyxl.load_workbook(JOKES_FILE, data_only=True)
+    ws     = wb.active
+    rows   = list(ws.iter_rows(values_only=True))
+
+    # Auto-detect header row
+    header = [str(c).strip().lower() if c else "" for c in rows[0]]
+    if "a" not in header:
+        raise ValueError("Could not find column 'A' in jokes.xlsx header row.")
+
+    # Map column names flexibly
+    col = {
+        "sno":     next((i for i, h in enumerate(header) if "s" in h and "no" in h), 0),
+        "A":       next((i for i, h in enumerate(header) if h == "a"), 1),
+        "B":       next((i for i, h in enumerate(header) if h == "b"), 2),
+        "A_again": next((i for i, h in enumerate(header) if "again" in h), 3),
+        "Laugh":   next((i for i, h in enumerate(header) if "laugh" in h), 4),
+    }
+
+    jokes = []
+    for row_idx, row in enumerate(rows[1:], start=1):   # skip header
+        a       = str(row[col["A"]]).strip()     if row[col["A"]]     else ""
+        b       = str(row[col["B"]]).strip()     if row[col["B"]]     else ""
+        a_again = str(row[col["A_again"]]).strip() if row[col["A_again"]] else ""
+        laugh   = str(row[col["Laugh"]]).strip() if row[col["Laugh"]] else ""
+
+        if a and b and a_again:   # skip empty rows
+            jokes.append({
+                "index":   row_idx,
+                "A":       a,
+                "B":       b,
+                "A_again": a_again,
+                "Laugh":   laugh if laugh else "Ha ha ha ha ha ha ha ha!",
+            })
+
+    print(f"  📋 Loaded {len(jokes)} jokes from jokes.xlsx")
+    return jokes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  STATE MANAGEMENT  (shuffle + pointer, persisted in state.json)
+# ══════════════════════════════════════════════════════════════════════════════
+def load_state(total_jokes: int) -> dict:
+    """
+    Load state.json.  If missing or stale (joke count changed), create fresh
+    shuffled order.  Returns state dict with keys: order, pointer.
+    """
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+            # Validate: must have order covering all current jokes
+            if (
+                isinstance(state.get("order"), list)
+                and len(state["order"]) == total_jokes
+                and isinstance(state.get("pointer"), int)
+            ):
+                print(f"  📂 State loaded — pointer at {state['pointer']}/{total_jokes}")
+                return state
+            else:
+                print("  ⚠️  State stale (joke count changed) — reshuffling.")
+        except Exception as e:
+            print(f"  ⚠️  Could not read state.json ({e}) — creating fresh state.")
+
+    order = list(range(total_jokes))
+    random.shuffle(order)
+    state = {"order": order, "pointer": 0}
+    print(f"  🔀 Fresh shuffle created ({total_jokes} jokes).")
+    return state
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+    print(f"  💾 State saved (pointer={state['pointer']})")
+
+
+def pick_joke(jokes: list, state: dict) -> dict:
+    """
+    Pick the next joke using the shuffled order.
+    If we've used all jokes, reshuffle and start over.
+    """
+    pointer = state["pointer"]
+    if pointer >= len(state["order"]):
+        print("  🔄 All jokes used — reshuffling the deck!")
+        order = list(range(len(jokes)))
+        random.shuffle(order)
+        state["order"]   = order
+        state["pointer"] = 0
+        pointer          = 0
+
+    joke_index = state["order"][pointer]
+    state["pointer"] = pointer + 1   # advance for next run
+
+    chosen = jokes[joke_index]
+    print(f"  🎯 Picked joke #{chosen['index']}: {chosen['A'][:50]}…")
+    return chosen
+
+
+def joke_to_dialogues(joke: dict) -> dict:
+    """Convert joke dict to the dialogues list format used by the rest of pipeline."""
+    return {
+        "dialogues": [
+            f"A: {joke['A']}",
+            f"B: {joke['B']}",
+            f"A: {joke['A_again']}",
+            f"AB: {joke['Laugh']}",
+        ]
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  SCENE IMAGE LOADER
 # ══════════════════════════════════════════════════════════════════════════════
 def _load_scene(filename: str) -> Image.Image:
-    """Load a full-scene PNG and resize to output W×H."""
     path = os.path.join(IMAGES_DIR, filename)
     img  = Image.open(path).convert("RGB")
     img  = img.resize((W, H), Image.LANCZOS)
@@ -100,7 +218,7 @@ print("    ✅ All 4 scenes loaded.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2.  FONT HELPER
+# 4.  FONT HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 def _get_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     suffix = "-Bold" if bold else ""
@@ -135,18 +253,9 @@ def _wrap(text: str, max_chars: int = 28) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3.  SPEECH BUBBLE
+# 5.  SPEECH BUBBLE
 # ══════════════════════════════════════════════════════════════════════════════
-def draw_bubble(canvas: Image.Image,
-                text: str,
-                speaker: str,        # "A", "B", or "AB"
-                alpha: float) -> None:
-    """
-    Overlay a speech bubble on canvas (in-place via alpha_composite).
-    speaker="A"  → black  character  → bubble on LEFT  side
-    speaker="B"  → orange character  → bubble on RIGHT side
-    speaker="AB" → laugh bubble      → centred, yellow tint
-    """
+def draw_bubble(canvas: Image.Image, text: str, speaker: str, alpha: float) -> None:
     if alpha <= 0:
         return
 
@@ -155,30 +264,27 @@ def draw_bubble(canvas: Image.Image,
     name_fnt = _get_font(22, bold=True)
     pad, lh  = 14, 32
     bh       = len(lines) * lh + pad * 2 + 36
-    bw       = 300                          # fixed bubble width
+    bw       = 300
 
-    # Pick anchor centre-x
     if speaker == "A":
-        bcx = BUBBLE_BLACK_CX
-        tab_label = "A"
+        bcx        = BUBBLE_BLACK_CX
+        tab_label  = "A"
         bg_col_rgb = (255, 255, 255)
     elif speaker == "B":
-        bcx = BUBBLE_ORANGE_CX
-        tab_label = "B"
+        bcx        = BUBBLE_ORANGE_CX
+        tab_label  = "B"
         bg_col_rgb = (255, 255, 255)
     else:
-        bcx = BUBBLE_AB_CX
-        tab_label = "A & B 😂"
+        bcx        = BUBBLE_AB_CX
+        tab_label  = "A & B 😂"
         bg_col_rgb = (255, 245, 180)
 
-    bx = bcx - bw // 2
-    by = BUBBLE_TOP_Y
+    bx    = bcx - bw // 2
+    by    = BUBBLE_TOP_Y
+    a_int = int(245 * min(1.0, alpha))
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d     = ImageDraw.Draw(layer)
 
-    a_int    = int(245 * min(1.0, alpha))
-    layer    = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d        = ImageDraw.Draw(layer)
-
-    # Bubble body
     d.rounded_rectangle(
         [bx, by, bx + bw, by + bh],
         radius=18,
@@ -187,7 +293,6 @@ def draw_bubble(canvas: Image.Image,
         width=2,
     )
 
-    # Speaker tab above bubble
     tab_w = max(70, len(tab_label) * 12 + 20)
     d.rounded_rectangle(
         [bx + 12, by - 28, bx + 12 + tab_w, by + 8],
@@ -202,7 +307,6 @@ def draw_bubble(canvas: Image.Image,
         anchor="mm",
     )
 
-    # Text lines
     for i, ln in enumerate(lines):
         d.text(
             (bx + pad, by + pad + 10 + i * lh),
@@ -217,11 +321,10 @@ def draw_bubble(canvas: Image.Image,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4.  FLOATING  HA!  TEXT
+# 6.  FLOATING  HA!  TEXT
 # ══════════════════════════════════════════════════════════════════════════════
-# Five HA! emitters spread across the top half of the frame
 HA_EMITTERS = [
-    (110, 350, 0.9),    # (x, start_y, speed_multiplier)
+    (110, 350, 0.9),
     (280, 280, 1.2),
     (390, 220, 0.8),
     (530, 300, 1.1),
@@ -234,12 +337,10 @@ def draw_ha_text(canvas: Image.Image, t: float) -> None:
     d     = ImageDraw.Draw(layer)
 
     for i, (ex, ey, spd) in enumerate(HA_EMITTERS):
-        # Each emitter cycles independently
-        phase = (t * spd + i * 0.38) % 1.0   # 0→1 = one full float cycle
-        y     = int(ey - 200 * phase)          # rises 200px over the cycle
+        phase = (t * spd + i * 0.38) % 1.0
+        y     = int(ey - 200 * phase)
         alpha = max(0, int(255 * (1.0 - phase)))
         if 0 < y < H and alpha > 15:
-            # Slight colour variety: red / dark-red / crimson
             colours = [(220,30,30),(180,0,0),(200,50,50),(230,60,0),(210,20,20)]
             col = (*colours[i % len(colours)], alpha)
             d.text((ex, y), "HA!", fill=col, font=font, anchor="mm")
@@ -250,128 +351,20 @@ def draw_ha_text(canvas: Image.Image, t: float) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5.  FRAME RENDERER
+# 7.  FRAME RENDERER
 # ══════════════════════════════════════════════════════════════════════════════
-def render_frame(scene_key: str,
-                 bubble_text: str,
-                 bubble_speaker: str,
-                 bubble_alpha: float,
-                 is_laugh: bool,
-                 t: float) -> np.ndarray:
-    """Return one RGB frame as a numpy array (H, W, 3)."""
+def render_frame(scene_key, bubble_text, bubble_speaker, bubble_alpha, is_laugh, t):
     frame = SCENES[scene_key].copy()
-
     if is_laugh:
         draw_ha_text(frame, t)
-
     draw_bubble(frame, bubble_text, bubble_speaker, bubble_alpha)
-
     return np.array(frame)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6.  GEMINI JOKE GENERATION
-# ══════════════════════════════════════════════════════════════════════════════
-MODEL_FALLBACKS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
-
-DEMO_JOKE = {
-    "dialogues": [
-        "A: Why can't you see in the dark?",
-        "B: I don't know, why?",
-        "A: Because there is no C in dark!",
-        "AB: Ha ha ha ha ha ha ha ha!",
-    ]
-}
-
-def _gemini(prompt: str, max_tokens: int = 400) -> str:
-    if not HAS_GEMINI:
-        raise RuntimeError("google-genai not installed.")
-    last_err = None
-    for model in MODEL_FALLBACKS:
-        try:
-            client = google_genai.Client(api_key=GEMINI_API_KEY)
-            cfg    = genai_types.GenerateContentConfig(
-                max_output_tokens=max_tokens,
-                temperature=0.9,
-                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-            )
-            resp = client.models.generate_content(model=model, contents=prompt, config=cfg)
-            return resp.text.strip()
-        except Exception as e:
-            last_err = e
-            err = str(e)
-            if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                continue
-            if "404" in err or "not found" in err.lower():
-                continue
-            raise
-    raise RuntimeError(f"All Gemini models failed: {last_err}")
-
-
-def generate_joke() -> dict:
-    if not HAS_GEMINI or not GEMINI_API_KEY:
-        print("  ⚠️  Gemini not available — using demo joke.")
-        return DEMO_JOKE
-
-    prompt = """You are a dad joke writer for a short animated video featuring two stickman friends, A and B, chatting in a park.
-
-Write ONE classic dad joke as a 3-line dialogue, followed by a shared laugh line.
-
-STRICT OUTPUT FORMAT — output exactly 4 lines, nothing else:
-A: <A asks a "why" or "what do you call" style question — the setup of the joke>
-B: <B responds with "I don't know, why?" or "I don't know, what?" — always curious, never the punchline>
-A: <A delivers the punchline — a short, punny, wordplay-based answer. The joke must hinge on a double meaning, homophones, or letter/word tricks. Keep it under 12 words.>
-AB: Ha ha ha ha ha ha ha ha!
-
-RULES:
-1. The joke MUST be a true dad joke — groan-worthy wordplay or pun, family-friendly, G-rated.
-2. Line 1 (A): Must be a question starting with "Why..." or "What do you call..." or "How do you...". Max 12 words.
-3. Line 2 (B): Must be EXACTLY one of:
-   - "I don't know, why?"
-   - "I don't know, what?"
-4. Line 3 (A): Punchline only. No explanation. Max 12 words. Funny due to wordplay.
-5. Line 4 (AB): Must be exactly — Ha ha ha ha ha ha ha ha!
-6. Do NOT add numbering, labels, asterisks, explanations, or commentary outside the 4 lines.
-7. Do NOT reuse: "no C in dark", "outstanding in his field", "nacho cheese".
-8. Output only the 4 lines. Nothing before. Nothing after."""
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            print(f"  🤖 Gemini attempt {attempt}/{MAX_RETRIES}…")
-            text  = _gemini(prompt)
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            dlg   = [l for l in lines if ":" in l][:4]
-
-            if len(dlg) != 4:
-                raise ValueError(f"Got {len(dlg)} lines, expected 4")
-            if not dlg[0].upper().startswith("A:"):
-                raise ValueError("Line 1 must be A:")
-            if not dlg[1].upper().startswith("B:"):
-                raise ValueError("Line 2 must be B:")
-            if not dlg[2].upper().startswith("A:"):
-                raise ValueError("Line 3 must be A:")
-            if not dlg[3].upper().startswith("AB:"):
-                raise ValueError("Line 4 must be AB:")
-
-            print("  ✅ Joke generated!")
-            for l in dlg:
-                print(f"     {l}")
-            return {"dialogues": dlg}
-
-        except Exception as e:
-            print(f"  ❌ Attempt {attempt} failed: {e}")
-            if attempt < MAX_RETRIES:
-                time.sleep(2)
-
-    print("  ⚠️  Using demo joke.")
-    return DEMO_JOKE
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 7.  AUDIO GENERATION
+# 8.  AUDIO GENERATION
 # ══════════════════════════════════════════════════════════════════════════════
 async def _speak(text: str, voice: str, path: str) -> None:
-    # edge-tts rate: -20% = 80% speed (slower, more natural)
     tts = edge_tts.Communicate(text, voice, rate="-20%")
     await tts.save(path)
 
@@ -408,7 +401,6 @@ def generate_all_audio(joke: dict) -> list:
         speaker = speaker.strip().upper()
         text    = text.strip()
 
-        # Laugh line: slow spaced-out text for natural pauses
         if speaker == "AB":
             tts_text = "Ha!  Ha!  Ha!  Ha!  Ha!  Ha!"
             voice    = VOICE_A
@@ -438,10 +430,9 @@ def generate_all_audio(joke: dict) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8.  AUDIO AMPLITUDE  (for mouth-open detection — used as talking pulse)
+# 9.  AUDIO DURATION
 # ══════════════════════════════════════════════════════════════════════════════
 def get_duration(path: str) -> float:
-    """Get audio duration in seconds using ffprobe."""
     try:
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -454,28 +445,25 @@ def get_duration(path: str) -> float:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 9.  VIDEO ASSEMBLY
+# 10.  VIDEO ASSEMBLY
 # ══════════════════════════════════════════════════════════════════════════════
 def build_frames(joke: dict, audio_files: list) -> list:
-    """Render all frames for all scenes and return as list of numpy arrays."""
     all_frames = []
 
     for i, line_data in enumerate(audio_files):
-        speaker  = line_data["speaker"]   # "A", "B", "AB"
+        speaker  = line_data["speaker"]
         text     = line_data["text"]
         path     = line_data["path"]
         is_laugh = speaker == "AB"
 
-        duration  = get_duration(path) if not is_laugh else LAUGH_DURATION
-        n_frames  = int(duration * FPS)
+        duration = get_duration(path) if not is_laugh else LAUGH_DURATION
+        n_frames = int(duration * FPS)
 
-        print(f"  🎬 Rendering scene {i+1}: [{speaker}] {text[:45]}… "
-              f"({duration:.1f}s, {n_frames} frames)")
+        print(f"  🎬 Scene {i+1}: [{speaker}] {text[:45]}… ({duration:.1f}s, {n_frames} frames)")
 
         for fi in range(n_frames):
             t = fi / FPS
 
-            # ── choose scene image ──────────────────────────────────────
             if is_laugh:
                 swap_period = max(1, FPS // LAUGH_SWAP_FPS)
                 scene_key   = "left" if (fi // swap_period) % 2 == 0 else "right"
@@ -484,16 +472,15 @@ def build_frames(joke: dict, audio_files: list) -> list:
             else:
                 scene_key = "orange_talking"
 
-            # ── bubble fade-in (0→1 over first 0.35s) ──────────────────
             bubble_alpha = min(1.0, max(0.0, (t - 0.15) / 0.35))
 
             frame = render_frame(
-                scene_key     = scene_key,
-                bubble_text   = text,
-                bubble_speaker= speaker,
-                bubble_alpha  = bubble_alpha,
-                is_laugh      = is_laugh,
-                t             = t,
+                scene_key      = scene_key,
+                bubble_text    = text,
+                bubble_speaker = speaker,
+                bubble_alpha   = bubble_alpha,
+                is_laugh       = is_laugh,
+                t              = t,
             )
             all_frames.append(frame)
 
@@ -501,7 +488,6 @@ def build_frames(joke: dict, audio_files: list) -> list:
 
 
 def write_silent_video(frames: list, out_path: str) -> None:
-    """Write frames to a silent mp4 using imageio."""
     print(f"  💾 Writing silent video ({len(frames)} frames)…")
     iio.imwrite(
         out_path,
@@ -514,13 +500,9 @@ def write_silent_video(frames: list, out_path: str) -> None:
 
 
 def merge_audio(video_path: str, audio_files: list, final_path: str) -> None:
-    """
-    Concatenate all audio files in order then mux with the video using ffmpeg.
-    """
     print("  🔊 Merging audio…")
     os.makedirs(AUDIO_DIR, exist_ok=True)
 
-    # Write ffmpeg concat list
     list_path = os.path.join(AUDIO_DIR, "concat.txt")
     with open(list_path, "w") as f:
         for af in audio_files:
@@ -529,7 +511,6 @@ def merge_audio(video_path: str, audio_files: list, final_path: str) -> None:
 
     concat_audio = os.path.join(AUDIO_DIR, "all_audio.aac")
 
-    # Concatenate all audio segments
     subprocess.run([
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0",
@@ -538,7 +519,6 @@ def merge_audio(video_path: str, audio_files: list, final_path: str) -> None:
         concat_audio,
     ], capture_output=True, check=True)
 
-    # Mux video + concatenated audio
     subprocess.run([
         "ffmpeg", "-y",
         "-i", video_path,
@@ -553,7 +533,7 @@ def merge_audio(video_path: str, audio_files: list, final_path: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 10.  METADATA
+# 11.  METADATA
 # ══════════════════════════════════════════════════════════════════════════════
 HASHTAGS = (
     "#Shorts #DadJokes #Stickman #FunnyAnimation #AnimatedShorts "
@@ -592,14 +572,14 @@ def save_metadata(joke: dict, meta: dict, base_name: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 11.  GOOGLE DRIVE UPLOAD  (optional)
+# 12.  GOOGLE DRIVE UPLOAD  (optional)
 # ══════════════════════════════════════════════════════════════════════════════
 def _drive_upload(file_path: str, folder_id: str, mime: str = "video/mp4"):
     try:
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaFileUpload
         from google.auth.transport.requests import Request
-        import pickle, base64, tempfile
+        import pickle, base64
     except ImportError:
         print("  ⚠️  pip install google-api-python-client google-auth-oauthlib")
         return None
@@ -643,55 +623,69 @@ def _drive_upload(file_path: str, folder_id: str, mime: str = "video/mp4"):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 12.  MAIN
+# 13.  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    print("\n😂  Stickman Dad Joke Pipeline  v2  (Full-Scene Image Edition)")
-    print("=" * 65)
+    print("\n😂  Stickman Dad Joke Pipeline  v3  (Excel + State Tracking Edition)")
+    print("=" * 70)
 
     if not HAS_IMAGEIO:
         print("❌  imageio required:  pip install imageio[ffmpeg]")
+        return
+    if not HAS_OPENPYXL:
+        print("❌  openpyxl required:  pip install openpyxl")
         return
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     base_name = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"   Base name: {base_name}")
 
-    # ── Step 1: joke ──────────────────────────────────────────────────────
-    print("\n📖 Step 1 — Generating joke…")
-    joke = generate_joke()
+    # ── Step 1: Load jokes from Excel ─────────────────────────────────────
+    print("\n📖 Step 1 — Loading jokes from jokes.xlsx…")
+    jokes = load_jokes()
 
-    # ── Step 2: metadata ──────────────────────────────────────────────────
-    print("\n🏷️  Step 2 — Metadata…")
+    # ── Step 2: Pick next joke using state ────────────────────────────────
+    print("\n🎯 Step 2 — Picking next joke…")
+    state = load_state(len(jokes))
+    chosen_joke = pick_joke(jokes, state)
+    save_state(state)   # save immediately so even a crash won't repeat the joke
+
+    joke = joke_to_dialogues(chosen_joke)
+    print(f"   Joke lines:")
+    for line in joke["dialogues"]:
+        print(f"     {line}")
+
+    # ── Step 3: Metadata ──────────────────────────────────────────────────
+    print("\n🏷️  Step 3 — Metadata…")
     meta      = generate_metadata(joke)
     json_path = save_metadata(joke, meta, base_name)
     print(f"   Title: {meta['youtube_title']}")
 
-    # ── Step 3: audio ─────────────────────────────────────────────────────
-    print("\n🎙️  Step 3 — Generating audio…")
+    # ── Step 4: Audio ─────────────────────────────────────────────────────
+    print("\n🎙️  Step 4 — Generating audio…")
     audio_files = generate_all_audio(joke)
 
-    # ── Step 4: render frames ─────────────────────────────────────────────
-    print("\n🎬 Step 4 — Rendering frames…")
+    # ── Step 5: Render frames ─────────────────────────────────────────────
+    print("\n🎬 Step 5 — Rendering frames…")
     frames = build_frames(joke, audio_files)
     print(f"   Total frames: {len(frames)}  ({len(frames)/FPS:.1f}s)")
 
-    # ── Step 5: write silent video ────────────────────────────────────────
+    # ── Step 6: Write silent video ────────────────────────────────────────
     silent_path = os.path.join(OUTPUT_DIR, f"{base_name}_silent.mp4")
     write_silent_video(frames, silent_path)
 
-    # ── Step 6: mux audio ─────────────────────────────────────────────────
+    # ── Step 7: Mux audio ─────────────────────────────────────────────────
     final_path = os.path.join(OUTPUT_DIR, f"{base_name}.mp4")
     try:
         merge_audio(silent_path, audio_files, final_path)
-        os.remove(silent_path)   # clean up temp
+        os.remove(silent_path)
     except Exception as e:
-        print(f"  ⚠️  Audio mux failed ({e}) — keeping silent video as output.")
+        print(f"  ⚠️  Audio mux failed ({e}) — keeping silent video.")
         final_path = silent_path
 
-    # ── Step 7: Drive upload (optional) ───────────────────────────────────
+    # ── Step 8: Drive upload (optional) ───────────────────────────────────
     if UPLOAD_TO_DRIVE:
-        print("\n☁️  Step 7 — Drive upload…")
+        print("\n☁️  Step 8 — Drive upload…")
         if GOOGLE_DRIVE_FOLDER:
             _drive_upload(final_path, GOOGLE_DRIVE_FOLDER, mime="video/mp4")
         if METADATA_DRIVE_FOLDER:
